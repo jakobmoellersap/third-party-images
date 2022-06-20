@@ -20,7 +20,6 @@
 
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_output.h>
-#include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_time.h>
@@ -28,12 +27,15 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_gzip.h>
+#include <fluent-bit/flb_config_map.h>
 #include <msgpack.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <errno.h>
+
+#include <openssl/evp.h>
 
 #include "sequentialhttp.h"
 #include "sequentialhttp_conf.h"
@@ -329,7 +331,7 @@ static int pack_msgpack_to_json_format_and_send_sequentially(struct flb_out_sequ
     size_t off = 0;
     char time_formatted[32];
     size_t s;
-    flb_sds_t out_js;
+    flb_sds_t out_json;
     msgpack_unpacked result;
     msgpack_object root;
     msgpack_object map;
@@ -384,14 +386,58 @@ static int pack_msgpack_to_json_format_and_send_sequentially(struct flb_out_sequ
         map = root.via.array.ptr[1];
         map_size = map.via.map.size;
 
+        //TODO REMOVE once new value was tested enough
+        map_size++;
+        unsigned char *ciphertext = (unsigned char*)"test";
+        unsigned char *plaintext = NULL;
+
+        static const int MAX_PADDING_LEN = 32;
+        int plaintext_len, cipher_len;
+
+        cipher_len = (int)strlen((char*)ciphertext);
+
+        // We'll pretend we don't know the input length here.  We do know that
+        // the ciphertext length is at most MAX_PADDING_LEN bytes + the input length.  So
+        // since the ciphertext is always greater than the input length, we can
+        // declare plaintext buffer size = ciphertext buffer size and know that
+        // there's no way we'll overflow our plaintext buffer.  It will have at
+        // most 16 bytes of wasted space on the end, but that's ok.
+        plaintext = (unsigned char *) flb_malloc(cipher_len + MAX_PADDING_LEN);
+        plaintext_len = 0;
+
+        if(!EVP_DecryptUpdate(ctx->cipher_ctx,
+                              plaintext, &plaintext_len,
+                              ciphertext, cipher_len)){
+            printf("ERROR in EVP_DecryptUpdate\n");
+            return FLB_ERROR;
+        }
+
+        // This function verifies the padding and then discards it.  It will
+        // return an error if the padding isn't what it expects, which means that
+        // the data was malformed or you are decrypting it with the wrong key.
+        if(!EVP_DecryptFinal(ctx->cipher_ctx,
+                                plaintext + plaintext_len, &plaintext_len)){
+            printf("ERROR in EVP_DecryptFinal\n");
+            return FLB_ERROR;
+        }
+
+        flb_sds_t decrypt_key = flb_sds_create("decrypted");
+        msgpack_pack_str_with_body(&tmp_pck, decrypt_key, flb_sds_len(decrypt_key));
+        flb_free(decrypt_key);
+
+        msgpack_pack_unsigned_char(&tmp_pck, *plaintext);
+        flb_free(plaintext);
+        EVP_CIPHER_CTX_reset(ctx->cipher_ctx);
+        //TODO REMOVE once new value was tested enough
+
+
+        // we need to allocate one more field for the date
         if (date_key != NULL)
         {
-            msgpack_pack_map(&tmp_pck, map_size + 1);
+            map_size++;
         }
-        else
-        {
-            msgpack_pack_map(&tmp_pck, map_size);
-        }
+
+        msgpack_pack_map(&tmp_pck, map_size);
 
         if (date_key != NULL)
         {
@@ -439,14 +485,14 @@ static int pack_msgpack_to_json_format_and_send_sequentially(struct flb_out_sequ
          */
 
         /* Encode current record into JSON in a temporary variable */
-        out_js = flb_msgpack_raw_to_json_sds(tmp_sbuf.data, tmp_sbuf.size);
-        if (!out_js)
+        out_json = flb_msgpack_raw_to_json_sds(tmp_sbuf.data, tmp_sbuf.size);
+        if (!out_json)
         {
             msgpack_sbuffer_destroy(&tmp_sbuf);
             return FLB_ERROR;
         }
 
-        ret_temp = http_post(ctx, out_js, flb_sds_len(out_js), tag, tag_len);
+        ret_temp = http_post(ctx, out_json, flb_sds_len(out_json), tag, tag_len);
         if (ret_temp == FLB_RETRY) {
             if (ret == FLB_RETRY || ret == FLB_OK ) {
                 ret = FLB_RETRY;
@@ -456,7 +502,7 @@ static int pack_msgpack_to_json_format_and_send_sequentially(struct flb_out_sequ
         }
 
         /* Release temporary json sds buffer */
-        flb_sds_destroy(out_js);
+        flb_sds_destroy(out_json);
     }
 
     /* if one log fails, the whole chunk has to be retried */
@@ -467,8 +513,8 @@ static int pack_msgpack_to_json_format_and_send_sequentially(struct flb_out_sequ
     msgpack_unpacked_destroy(&result);
     return ret;
 }
-static void cb_http_flush(const void *data, size_t bytes,
-                          const char *tag, int tag_len,
+static void cb_http_flush(struct flb_event_chunk *event_chunk,
+                          struct flb_output_flush *out_flush,
                           struct flb_input_instance *i_ins,
                           void *out_context,
                           struct flb_config *config)
@@ -496,17 +542,19 @@ static void cb_http_flush(const void *data, size_t bytes,
         // flb_sds_destroy(json);
         // }
 
-        ret = pack_msgpack_to_json_format_and_send_sequentially(ctx, data, bytes,
+        ret = pack_msgpack_to_json_format_and_send_sequentially(ctx, event_chunk->data, event_chunk->size,
                                                                 ctx->out_format,
                                                                 ctx->json_date_format,
-                                                                ctx->date_key, tag,
-                                                                tag_len);
+                                                                ctx->date_key, event_chunk->tag,
+                                                                (int) flb_sds_len(event_chunk->tag));
     }
     else if (ctx->out_format == FLB_HTTP_OUT_GELF) {
-        ret = http_gelf(ctx, data, bytes, tag, tag_len);
+        ret = http_gelf(ctx, event_chunk->data, event_chunk->size, event_chunk->tag,
+                        (int) flb_sds_len(event_chunk->tag));
     }
     else {
-        ret = http_post(ctx, data, bytes, tag, tag_len);
+        ret = http_post(ctx, event_chunk->data, event_chunk->size, event_chunk->tag,
+                        (int) flb_sds_len(event_chunk->tag));
     }
 
     FLB_OUTPUT_RETURN(ret);

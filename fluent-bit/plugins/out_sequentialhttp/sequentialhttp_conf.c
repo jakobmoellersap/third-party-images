@@ -22,12 +22,12 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
-#include <fluent-bit/flb_kv.h>
+#include <openssl/evp.h>
 
 #include "sequentialhttp.h"
 #include "sequentialhttp_conf.h"
 
-struct flb_out_sequentialhttp *flb_http_conf_create(struct flb_output_instance *ins,
+struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instance *ins,
                                           struct flb_config *config)
 {
     int ret;
@@ -193,6 +193,52 @@ struct flb_out_sequentialhttp *flb_http_conf_create(struct flb_output_instance *
         }
     }
 
+    /**
+     * Setup Decryption
+     */
+
+    EVP_CIPHER_CTX *cipher_ctx;
+    const EVP_CIPHER *evp_cipher;
+    unsigned char *encrypt_iv, *encrypt_key;
+
+    tmp = flb_output_get_property("encrypt_key", ins);
+    encrypt_key = (unsigned char *) flb_strdup(tmp);
+
+    tmp = flb_output_get_property("encrypt_iv", ins);
+    encrypt_iv = (unsigned char *) flb_strdup(tmp);
+
+    tmp = flb_output_get_property("encrypt_key_length", ins);
+    switch(atoi(tmp))
+    {
+        case 128: evp_cipher = EVP_aes_128_gcm();break;
+        case 192: evp_cipher = EVP_aes_192_gcm();break;
+        default: evp_cipher = EVP_aes_256_gcm();break;
+    }
+
+    cipher_ctx = EVP_CIPHER_CTX_new();
+    if ( ! EVP_DecryptInit(cipher_ctx, evp_cipher, NULL, NULL) )
+    {
+        flb_plg_error(ctx->ins, "Could not initialize cipher context for decryption");
+    }
+
+    if ( ! EVP_DecryptInit_ex(cipher_ctx, evp_cipher, NULL, encrypt_key, encrypt_iv) )
+    {
+        flb_plg_error(ctx->ins, "Could not initialize cipher context for decryption");
+    }
+
+    if ( EVP_CIPHER_CTX_key_length(cipher_ctx) != 32 )
+    {
+        flb_plg_error(ctx->ins, "Wrong Key length for decryption");
+    }
+
+    if ( EVP_CIPHER_CTX_iv_length(cipher_ctx) == 16 )
+    {
+        flb_plg_error(ctx->ins, "Wrong IV length for decryption");
+    }
+
+
+    ctx->cipher_ctx = cipher_ctx;
+
     ctx->u = upstream;
     ctx->uri = uri;
     ctx->host = ins->host.name;
@@ -213,6 +259,8 @@ void flb_http_conf_destroy(struct flb_out_sequentialhttp *ctx)
     if (ctx->u) {
         flb_upstream_destroy(ctx->u);
     }
+
+    EVP_CIPHER_CTX_free(ctx->cipher_ctx);
 
     flb_free(ctx->proxy_host);
     flb_free(ctx->uri);

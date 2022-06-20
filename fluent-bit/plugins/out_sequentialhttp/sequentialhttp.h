@@ -73,6 +73,10 @@ struct flb_out_sequentialhttp {
 
     /* Plugin instance */
     struct flb_output_instance *ins;
+
+
+    /* Encryption Cipher Context */
+    EVP_CIPHER_CTX *cipher_ctx;
 };
 
 #endif

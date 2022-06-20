@@ -29,7 +29,7 @@ RUN apt-get update && \
     flex \
     bison \
     libjemalloc-dev \
-    libc-ares-dev \ 
+    libc-ares-dev \
     && curl -L -o "/tmp/fluent-bit.tar.gz" ${FLB_SOURCE} \
     && cd tmp/ && mkdir fluent-bit \
     && tar zxfv fluent-bit.tar.gz -C ./fluent-bit --strip-components=1 \
@@ -57,26 +57,27 @@ COPY plugins /plugins
 RUN mkdir -p /plugins/build/
 WORKDIR /plugins/build/
 RUN cmake -DFLB_SOURCE=/tmp/fluent-bit \
-          -DPLUGIN_NAME=out_sequentialhttp  ../
+          -DPLUGIN_NAME=out_sequentialhttp  ../ \
+          -DOPENSSL_ROOT_DIR=/usr/local/ssl
 RUN make -j $(getconf _NPROCESSORS_ONLN)
 
 # build loki plugin
-FROM golang:1.17 as loki-builder
-ARG LOKI_VERSION
-
-RUN mkdir -p /tmp/src /loki
-RUN curl -L https://github.com/grafana/loki/archive/v${LOKI_VERSION}.tar.gz | \
-    tar zx --strip=1 -C /tmp/src/
-WORKDIR /tmp/src
-RUN make clean && make BUILD_IN_CONTAINER=false fluent-bit-plugin 
-RUN cp /tmp/src/cmd/fluent-bit/out_grafana_loki.so /loki
+#FROM golang:1.17 as loki-builder
+#ARG LOKI_VERSION
+#
+#RUN mkdir -p /tmp/src /loki
+#RUN curl -L https://github.com/grafana/loki/archive/v${LOKI_VERSION}.tar.gz | \
+#    tar zx --strip=1 -C /tmp/src/
+#WORKDIR /tmp/src
+#RUN make clean && make BUILD_IN_CONTAINER=false fluent-bit-plugin
+#RUN cp /tmp/src/cmd/fluent-bit/out_grafana_loki.so /loki
 
 # Take upstream image and copy over our plugins
 FROM fluentbit
 
 COPY --from=plugin-builder /plugins/build/flb-out_sequentialhttp.so /fluent-bit/lib/flb-out_sequentialhttp.so
-COPY --from=loki-builder /loki/out_grafana_loki.so /fluent-bit/lib/out_grafana_loki.so
+# COPY --from=loki-builder /loki/out_grafana_loki.so /fluent-bit/lib/out_grafana_loki.so
 
 LABEL source=git@github.com:kyma-project/kyma.git
-CMD ["/fluent-bit/bin/fluent-bit", "-e", "/fluent-bit/lib/flb-out_sequentialhttp.so", "-e", "/fluent-bit/lib/out_grafana_loki.so", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+CMD ["/fluent-bit/bin/fluent-bit", "-e", "/fluent-bit/lib/flb-out_sequentialhttp.so", "-c", "/fluent-bit/etc/fluent-bit.conf"]
 

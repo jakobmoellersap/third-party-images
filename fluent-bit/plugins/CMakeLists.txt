@@ -1,5 +1,6 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.0)
 project(plugin)
+set(CMAKE_MACOSX_RPATH 1)
 
 # Macro to build source code
 macro(FLB_PLUGIN name src deps)
@@ -8,6 +9,9 @@ macro(FLB_PLUGIN name src deps)
   set_target_properties(flb-${name} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
   target_link_libraries(flb-${name} ${deps})
+  message("linking OpenSSL for flb-${name}")
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(flb-${name} OpenSSL::SSL)
 endmacro()
 
 # Fluent Bit source code environment

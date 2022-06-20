@@ -23,6 +23,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_parser.h>
 
 #include "sequentialhttp.h"
 
