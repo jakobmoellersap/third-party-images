@@ -14,6 +14,8 @@ macro(FLB_PLUGIN name src deps)
   target_link_libraries(flb-${name} OpenSSL::SSL)
 endmacro()
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__=__FILE__")
+
 # Fluent Bit source code environment
 if(NOT DEFINED FLB_SOURCE OR FLB_SOURCE STREQUAL "")
   message(FATAL_ERROR "No Fluent Bit source directory has been defined")

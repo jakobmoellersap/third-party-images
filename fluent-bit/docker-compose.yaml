@@ -1,0 +1,23 @@
+version: "3.9"
+services:
+  httpbin:
+    image: kennethreitz/httpbin
+    ports:
+      - "8000:80"
+  fluent-bit:
+    container_name: fluent-bit-local-test
+    build:
+      dockerfile: ./Dockerfile
+      args:
+        FLB_VERSION: 1.9.4
+        LOKI_VERSION: 2.5.0
+    volumes:
+      - type: bind
+        source: ./test
+        target: /tmp/fluent-bit
+    command:
+      - /fluent-bit/bin/fluent-bit
+      - -e
+      - /fluent-bit/lib/flb-out_extendedhttp.so
+      - -c
+      - /tmp/fluent-bit/fluent-bit.conf

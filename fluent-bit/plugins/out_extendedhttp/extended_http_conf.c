@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019-2021 The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,12 +21,20 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_kv.h>
+#include <fluent-bit/flb_record_accessor.h>
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+#include <fluent-bit/flb_aws_credentials.h>
+#endif
+#endif
+#include "extended_http.h"
+#include "extended_http_conf.h"
+#include "base64.h"
+
 #include <openssl/evp.h>
 
-#include "sequentialhttp.h"
-#include "sequentialhttp_conf.h"
-
-struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instance *ins,
+struct flb_out_http *flb_extendedhttp_conf_create(struct flb_output_instance *ins,
                                           struct flb_config *config)
 {
     int ret;
@@ -40,10 +47,10 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     char *tmp_uri = NULL;
     const char *tmp;
     struct flb_upstream *upstream;
-    struct flb_out_sequentialhttp *ctx = NULL;
+    struct flb_out_http *ctx = NULL;
 
     /* Allocate plugin context */
-    ctx = flb_calloc(1, sizeof(struct flb_out_sequentialhttp));
+    ctx = flb_calloc(1, sizeof(struct flb_out_http));
     if (!ctx) {
         flb_errno();
         return NULL;
@@ -54,6 +61,34 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     if (ret == -1) {
         flb_free(ctx);
         return NULL;
+    }
+
+    if (ctx->headers_key && !ctx->body_key) {
+        flb_plg_error(ctx->ins, "when setting headers_key, body_key is also required");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    if (ctx->body_key && !ctx->headers_key) {
+        flb_plg_error(ctx->ins, "when setting body_key, headers_key is also required");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    if (ctx->body_key && ctx->headers_key) {
+        ctx->body_ra = flb_ra_create(ctx->body_key, FLB_FALSE);
+        if (!ctx->body_ra) {
+            flb_plg_error(ctx->ins, "failed to allocate body record accessor");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        ctx->headers_ra = flb_ra_create(ctx->headers_key, FLB_FALSE);
+        if (!ctx->headers_ra) {
+            flb_plg_error(ctx->ins, "failed to allocate headers record accessor");
+            flb_free(ctx);
+            return NULL;
+        }
     }
 
     /*
@@ -82,6 +117,39 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
         flb_output_net_default("127.0.0.1", 80, ins);
     }
 
+    /* Check if AWS SigV4 authentication is enabled */
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+    if (ctx->has_aws_auth) {
+        ctx->aws_service = flb_output_get_property(FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                                                   "service", ctx->ins);
+        if (!ctx->aws_service) {
+            flb_plg_error(ins, "aws_auth option requires " FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                          "service to be set");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        ctx->aws_provider = flb_managed_chain_provider_create(
+            ins,
+            config,
+            FLB_HTTP_AWS_CREDENTIAL_PREFIX,
+            NULL,
+            flb_aws_client_generator()
+        );
+        if (!ctx->aws_provider) {
+            flb_plg_error(ins, "failed to create aws credential provider for sigv4 auth");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        /* If managed provider creation succeeds, then region key is present */
+        ctx->aws_region = flb_output_get_property(FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                                                  "region", ctx->ins);
+    }
+#endif /* !FLB_HAVE_AWS */
+#endif /* !FLB_HAVE_SIGNV4 */
+
     /* Check if SSL/TLS is enabled */
 #ifdef FLB_HAVE_TLS
     if (ins->use_tls == FLB_TRUE) {
@@ -99,8 +167,8 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     }
 
     if (ctx->proxy) {
-        //flb_plg_trace(ctx->ins, "Upstream Proxy=%s:%i",
-        //              ctx->proxy_host, ctx->proxy_port);
+        flb_plg_trace(ctx->ins, "Upstream Proxy=%s:%i",
+                      ctx->proxy_host, ctx->proxy_port);
         upstream = flb_upstream_create(config,
                                        ctx->proxy_host,
                                        ctx->proxy_port,
@@ -196,27 +264,48 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     /**
      * Setup Decryption
      */
+    flb_plg_info(ctx->ins, "%s", "Initializing Cipher Context");
 
     EVP_CIPHER_CTX *cipher_ctx;
     const EVP_CIPHER *evp_cipher;
-    unsigned char *encrypt_iv, *encrypt_key;
+    unsigned char *encrypt_iv = NULL, *encrypt_key;
 
     tmp = flb_output_get_property("encrypt_key", ins);
-    encrypt_key = (unsigned char *) flb_strdup(tmp);
-
-    tmp = flb_output_get_property("encrypt_iv", ins);
-    encrypt_iv = (unsigned char *) flb_strdup(tmp);
-
-    tmp = flb_output_get_property("encrypt_key_length", ins);
-    switch(atoi(tmp))
-    {
-        case 128: evp_cipher = EVP_aes_128_gcm();break;
-        case 192: evp_cipher = EVP_aes_192_gcm();break;
-        default: evp_cipher = EVP_aes_256_gcm();break;
+    if (tmp) {
+        encrypt_key = (unsigned char *) flb_strdup(tmp);
+        flb_plg_info(ctx->ins, "Initialized with key %s, length is %u", encrypt_key);
+    } else {
+        flb_plg_error(ctx->ins, "Could not setup encryption, encrypt_key is missing in configuration");
     }
 
+    tmp = flb_output_get_property("encrypt_iv", ins);
+    if (tmp) {
+        const unsigned char *encrypt_iv_encoded = (const unsigned char *) flb_strdup(tmp);
+        size_t iv_length;
+        encrypt_iv = base64_decode(encrypt_iv_encoded, strlen(tmp), &iv_length);
+        flb_plg_info(ctx->ins, "Initialized with iv %s, IV Length is %u", encrypt_iv_encoded, iv_length);
+    } else {
+        flb_plg_error(ctx->ins, "Could not setup encryption, encrypt_iv is missing in configuration");
+    }
+
+
+    tmp = flb_output_get_property("encrypt_key_length", ins);
+    if (tmp) {
+        switch(atoi(tmp))
+        {
+            case 128: evp_cipher = EVP_aes_128_gcm();break;
+            case 192: evp_cipher = EVP_aes_192_gcm();break;
+            default: evp_cipher = EVP_aes_256_gcm();break;
+        }
+        flb_plg_info(ctx->ins, "%s%s", "Initialized with AES-", tmp);
+    } else {
+        evp_cipher = EVP_aes_256_gcm();
+        flb_plg_info(ctx->ins, "%s", "Initialized with AES-256");
+    }
+
+
     cipher_ctx = EVP_CIPHER_CTX_new();
-    if ( ! EVP_DecryptInit(cipher_ctx, evp_cipher, NULL, NULL) )
+    if ( ! EVP_DecryptInit_ex(cipher_ctx, evp_cipher, NULL, NULL, NULL) )
     {
         flb_plg_error(ctx->ins, "Could not initialize cipher context for decryption");
     }
@@ -229,13 +318,16 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     if ( EVP_CIPHER_CTX_key_length(cipher_ctx) != 32 )
     {
         flb_plg_error(ctx->ins, "Wrong Key length for decryption");
+    } else {
+        flb_plg_info(ctx->ins, "Correct Key length for decryption!");
     }
 
-    if ( EVP_CIPHER_CTX_iv_length(cipher_ctx) == 16 )
+    if ( EVP_CIPHER_CTX_iv_length(cipher_ctx) != 12 )
     {
         flb_plg_error(ctx->ins, "Wrong IV length for decryption");
+    } else {
+        flb_plg_info(ctx->ins, "Correct IV length for decryption!");
     }
-
 
     ctx->cipher_ctx = cipher_ctx;
 
@@ -250,15 +342,28 @@ struct flb_out_sequentialhttp *flb_http_conf_create_new(struct flb_output_instan
     return ctx;
 }
 
-void flb_http_conf_destroy(struct flb_out_sequentialhttp *ctx)
+void flb_http_conf_destroy(struct flb_out_http *ctx)
 {
     if (!ctx) {
         return;
     }
 
+    if (ctx->body_ra && ctx->headers_ra) {
+        flb_ra_destroy(ctx->body_ra);
+        flb_ra_destroy(ctx->headers_ra);
+    }
+
     if (ctx->u) {
         flb_upstream_destroy(ctx->u);
     }
+
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+    if (ctx->aws_provider) {
+        flb_aws_provider_destroy(ctx->aws_provider);
+    }
+#endif
+#endif
 
     EVP_CIPHER_CTX_free(ctx->cipher_ctx);
 

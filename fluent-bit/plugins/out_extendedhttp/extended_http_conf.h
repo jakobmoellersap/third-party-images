@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019-2021 The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,17 +17,18 @@
  *  limitations under the License.
  */
 
-#ifndef FLB_OUT_SEQUENTIAL_HTTP_CONF_H
-#define FLB_OUT_SEQUENTIAL_HTTP_CONF_H
+#ifndef FLB_OUT_HTTP_CONF_H
+#define FLB_OUT_HTTP_CONF_H
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_output.h>
-#include <fluent-bit/flb_parser.h>
 
-#include "sequentialhttp.h"
+#include "extended_http.h"
 
-struct flb_out_sequentialhttp *flb_http_conf_create(struct flb_output_instance *ins,
+struct flb_out_http *flb_extendedhttp_conf_create(struct flb_output_instance *ins,
                                           struct flb_config *config);
-void flb_http_conf_destroy(struct flb_out_sequentialhttp *ctx);
+void flb_http_conf_destroy(struct flb_out_http *ctx);
+
+uint8_t* datahex(char* string);
 
 #endif
